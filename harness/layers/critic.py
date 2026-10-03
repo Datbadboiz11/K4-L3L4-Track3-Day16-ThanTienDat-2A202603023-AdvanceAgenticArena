@@ -70,6 +70,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import re
 from harness.middleware import Middleware
 
 
@@ -79,16 +80,71 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not isinstance(report, dict):
+            return report
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Tài liệu không cung cấp đủ căn cứ để trả lời."
+            return report
+
+        new_claims = []
+        has_split = False
+        observed = ctx.observed_text or ""
+
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text", "")
+            if not text:
+                continue
+
+            # 2. Nếu claim["text"] có trong ctx.observed_text -> giữ nguyên (KHÔNG sửa chữ)
+            if text in observed:
+                new_claims.append(claim)
+                continue
+
+            # 3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring)
+            split_result = None
+            for m in re.finditer(r"\s+(?:và\s+)+", text):
+                start, end = m.span()
+                left = text[:start]
+                right = text[end:]
+                if left in observed and right in observed:
+                    doc_left = None
+                    doc_right = None
+                    if getattr(ctx, "corpus", None) and hasattr(ctx.corpus, "docs"):
+                        for doc in ctx.corpus.docs:
+                            if doc_left is None and left in doc.body:
+                                doc_left = doc.doc_id
+                            if doc_right is None and right in doc.body:
+                                doc_right = doc.doc_id
+                    if doc_left and doc_right and doc_left != doc_right:
+                        split_result = ((left, doc_left), (right, doc_right))
+                        break
+
+            if split_result:
+                (left_text, left_doc), (right_text, right_doc) = split_result
+                new_claims.append({"text": left_text, "doc_id": left_doc})
+                new_claims.append({"text": right_text, "doc_id": right_doc})
+                has_split = True
+            # 4. Không tách được -> đây là bịa: bỏ claim đi
+
+        if has_split or report.get("abstain"):
+            report["abstain"] = True
+
+        # 5. Nếu không còn claim nào: report["abstain"] = True,
+        #    claims = [], citations = [], và viết lại "answer" nói rõ là không đủ căn cứ.
+        if not new_claims:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Tài liệu không cung cấp đủ căn cứ để trả lời."
+        else:
+            report["claims"] = new_claims
+            # 6. Cập nhật report["citations"] cho khớp với claims còn lại.
+            report["citations"] = sorted(set(c["doc_id"] for c in new_claims if "doc_id" in c))
+
+        return report
